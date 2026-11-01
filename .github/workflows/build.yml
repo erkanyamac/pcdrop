@@ -30,8 +30,9 @@ jobs:
 
       - name: Update CocoaPods repo
         run: |
-          pod repo add trunk https://cdn.cocoapods.org/ || true
-          pod repo update trunk
+          cd ios
+          pod install --repo-update
+          cd ..
 
       - name: Build unsigned iOS archive and IPA
         run: flutter build ipa --release --no-codesign
