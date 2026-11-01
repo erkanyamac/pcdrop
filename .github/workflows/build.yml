@@ -1,0 +1,41 @@
+name: Build iOS unsigned
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: Build unsigned iOS app
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build unsigned iOS archive and IPA
+        run: flutter build ipa --release --no-codesign
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcdrop-ios-unsigned
+          if-no-files-found: error
+          path: |
+            build/ios/archive/*.xcarchive
+            build/ios/ipa/*.ipa
