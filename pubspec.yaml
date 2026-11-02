@@ -45,8 +45,8 @@ dependencies:
   uuid: ^4.6.0
   crypto: ^3.0.8
   permission_handler: ^13.0.2
-  network_info_plus: ^8.2.2
   device_info_plus: ^13.3.0
+  open_filex: ^5.0.0
 
 dev_dependencies:
   flutter_test:

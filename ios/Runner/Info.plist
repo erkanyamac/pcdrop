@@ -26,6 +26,16 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PCDrop, yakındaki cihazları bulmak ve dosya göndermek için yerel ağınızı kullanır.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_pcdrop._tcp</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

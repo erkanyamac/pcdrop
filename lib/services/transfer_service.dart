@@ -6,12 +6,15 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shelf/shelf.dart' as shelf;
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
+import 'package:uuid/uuid.dart';
 
 import '../core/constants.dart';
+import '../models/device.dart';
 import '../models/transfer_session.dart';
 
 typedef UploadApprovalCallback = Future<bool> Function(TransferSession session);
@@ -25,6 +28,7 @@ class TransferProgress {
     this.bytesPerSecond = 0,
     this.remaining = Duration.zero,
     this.isComplete = false,
+    this.filePath,
     this.error,
   });
 
@@ -35,6 +39,7 @@ class TransferProgress {
   final double bytesPerSecond;
   final Duration remaining;
   final bool isComplete;
+  final String? filePath;
   final String? error;
 
   double get percentage =>
@@ -42,8 +47,13 @@ class TransferProgress {
 }
 
 class TransferProgressNotifier extends Notifier<TransferProgress> {
+  final List<TransferProgress> _completedTransfers = [];
+
   @override
   TransferProgress build() => const TransferProgress();
+
+  List<TransferProgress> get completedTransfers =>
+      List.unmodifiable(_completedTransfers);
 
   void update({
     required String fileId,
@@ -53,8 +63,9 @@ class TransferProgressNotifier extends Notifier<TransferProgress> {
     required double bytesPerSecond,
     required Duration remaining,
     bool isComplete = false,
+    String? filePath,
   }) {
-    state = TransferProgress(
+    final next = TransferProgress(
       fileId: fileId,
       fileName: fileName,
       transferredBytes: transferredBytes,
@@ -62,7 +73,13 @@ class TransferProgressNotifier extends Notifier<TransferProgress> {
       bytesPerSecond: bytesPerSecond,
       remaining: remaining,
       isComplete: isComplete,
+      filePath: filePath,
     );
+    state = next;
+    if (isComplete) {
+      _completedTransfers.removeWhere((item) => item.fileId == fileId);
+      _completedTransfers.insert(0, next);
+    }
   }
 
   void fail(Object error) {
@@ -75,6 +92,11 @@ final transferProgressProvider =
       TransferProgressNotifier.new,
     );
 
+final completedTransfersProvider = Provider<List<TransferProgress>>((ref) {
+  ref.watch(transferProgressProvider);
+  return ref.read(transferProgressProvider.notifier).completedTransfers;
+});
+
 class TransferService {
   TransferService({this.onUploadApproval, Dio? dio, this.onProgress})
     : _dio = dio ?? Dio();
@@ -84,7 +106,9 @@ class TransferService {
   final void Function(TransferProgress progress)? onProgress;
   final Map<String, _UploadGrant> _grants = {};
   final Random _random = Random.secure();
+  final String _serverDeviceId = const Uuid().v4();
   HttpServer? _server;
+  Device? _device;
 
   void setUploadApprovalCallback(UploadApprovalCallback callback) {
     onUploadApproval = callback;
@@ -93,10 +117,12 @@ class TransferService {
   Future<void> startReceiver({
     int port = NetworkConstants.defaultPort,
     SecurityContext? securityContext,
+    Device? device,
   }) async {
     if (_server != null) {
       return;
     }
+    _device = device;
 
     final router = Router()
       ..get('/api/v1/info', (request) => _info(request))
@@ -115,6 +141,7 @@ class TransferService {
   Future<void> stopReceiver() async {
     final server = _server;
     _server = null;
+    _device = null;
     _grants.clear();
     await server?.close(force: true);
   }
@@ -125,6 +152,8 @@ class TransferService {
       'version': NetworkConstants.protocolVersion,
       'port': _server?.port ?? NetworkConstants.defaultPort,
       'serviceType': NetworkConstants.serviceType,
+      'id': _device?.id ?? _serverDeviceId,
+      ...?_device?.toJson(),
     });
   }
 
@@ -225,7 +254,14 @@ class TransferService {
         );
       }
       digestInput.close();
+      await sink.flush();
       await sink.close();
+      if (!destination.existsSync() || destination.lengthSync() <= 0) {
+        return _jsonResponse({
+          'status': 'FAILED',
+          'reason': 'Kaydedilen dosya boş veya bulunamadı',
+        }, statusCode: HttpStatus.internalServerError);
+      }
       final digestValue = digest.toString();
       final expectedDigest = request.headers['x-sha256'];
       if (expectedDigest != null &&
@@ -236,6 +272,7 @@ class TransferService {
           'reason': 'SHA-256 checksum mismatch',
         }, statusCode: HttpStatus.badRequest);
       }
+      await OpenFilex.open(destination.path);
       grant.fileIds.remove(fileId);
       if (grant.fileIds.isEmpty) {
         _grants.remove(token);
@@ -247,12 +284,14 @@ class TransferService {
         totalBytes: totalBytes,
         stopwatch: stopwatch,
         isComplete: true,
+        filePath: destination.path,
       );
       return _jsonResponse({
         'status': 'COMPLETED',
         'fileName': destination.uri.pathSegments.last,
+        'filePath': destination.path,
         'sha256': digestValue,
-      });
+      }, statusCode: HttpStatus.ok);
     } on Object catch (error) {
       await sink.close();
       try {
@@ -315,7 +354,7 @@ class TransferService {
     final checksum = file.sha256 ?? await _sha256File(source);
     final stopwatch = Stopwatch()..start();
     try {
-      await _dio.post<void>(
+      final response = await _dio.post<void>(
         'http://$targetIp:$targetPort${NetworkConstants.uploadPath}',
         queryParameters: {
           'sessionId': sessionId,
@@ -341,6 +380,11 @@ class TransferService {
           );
         },
       );
+      if (response.statusCode != HttpStatus.ok) {
+        throw StateError(
+          'Dosya aktarımı HTTP ${response.statusCode ?? 'bilinmeyen'} yanıtıyla tamamlanamadı',
+        );
+      }
       _publishProgress(
         fileId: file.fileId,
         fileName: file.fileName,
@@ -348,6 +392,7 @@ class TransferService {
         totalBytes: totalBytes,
         stopwatch: stopwatch,
         isComplete: true,
+        filePath: source.path,
       );
     } catch (error) {
       onProgress?.call(TransferProgress(error: error.toString()));
@@ -472,6 +517,7 @@ class TransferService {
     required int totalBytes,
     required Stopwatch stopwatch,
     bool isComplete = false,
+    String? filePath,
   }) {
     final elapsedSeconds = stopwatch.elapsedMilliseconds / 1000;
     final bytesPerSecond = elapsedSeconds <= 0
@@ -490,6 +536,7 @@ class TransferService {
         bytesPerSecond: bytesPerSecond.toDouble(),
         remaining: remaining,
         isComplete: isComplete,
+        filePath: filePath,
       ),
     );
   }
@@ -519,6 +566,7 @@ final transferServiceProvider = Provider<TransferService>((ref) {
         bytesPerSecond: value.bytesPerSecond,
         remaining: value.remaining,
         isComplete: value.isComplete,
+        filePath: value.filePath,
       );
     },
   );

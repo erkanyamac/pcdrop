@@ -3,25 +3,22 @@ import 'dart:io';
 
 import 'package:bonsoir/bonsoir.dart';
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:network_info_plus/network_info_plus.dart';
 import 'package:uuid/uuid.dart';
 
 import '../core/constants.dart';
 import '../models/device.dart';
 
 class DiscoveryService {
-  DiscoveryService({
-    DeviceInfoPlugin? deviceInfo,
-    NetworkInfo? networkInfo,
-    Uuid? uuid,
-  }) : _deviceInfo = deviceInfo ?? DeviceInfoPlugin(),
-       _networkInfo = networkInfo ?? NetworkInfo(),
-       _uuid = uuid ?? const Uuid();
+  DiscoveryService({DeviceInfoPlugin? deviceInfo, Dio? dio, Uuid? uuid})
+    : _deviceInfo = deviceInfo ?? DeviceInfoPlugin(),
+      _dio = dio ?? Dio(),
+      _uuid = uuid ?? const Uuid();
 
   final DeviceInfoPlugin _deviceInfo;
-  final NetworkInfo _networkInfo;
+  final Dio _dio;
   final Uuid _uuid;
 
   BonsoirBroadcast? _broadcast;
@@ -46,12 +43,13 @@ class DiscoveryService {
     _localDevice = localDevice;
     _deviceId = localDevice.id;
 
-    final localIp = await _networkInfo.getWifiIP();
+    final localIps = await _activeLocalIpv4Addresses();
+    final localIp = localIps.isEmpty ? null : localIps.first;
     _localIp = localIp;
     final service = BonsoirService(
       name: localDevice.alias,
       type: NetworkConstants.serviceType,
-      hostAddresses: localIp == null ? const [] : [localIp],
+      hostAddresses: localIps,
       port: localDevice.port,
       attributes: localDevice.toJson().map(
         (key, value) => MapEntry(key, value.toString()),
@@ -92,6 +90,22 @@ class DiscoveryService {
 
     await broadcast.start();
     await discovery.start();
+  }
+
+  Future<Device> fetchDevice(String ip) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      'http://$ip:${NetworkConstants.defaultPort}/api/v1/info',
+    );
+    final data = response.data;
+    if (response.statusCode != HttpStatus.ok || data == null) {
+      throw StateError('Cihaz bilgileri alınamadı.');
+    }
+
+    return Device.fromJson({
+      ...data,
+      'address': ip,
+      'port': data['port'] ?? NetworkConstants.defaultPort,
+    }, fallbackIp: ip);
   }
 
   Future<void> stop() async {
@@ -136,6 +150,21 @@ class DiscoveryService {
       port: NetworkConstants.defaultPort,
       version: NetworkConstants.protocolVersion,
     );
+  }
+
+  Future<List<String>> _activeLocalIpv4Addresses() async {
+    final interfaces = await NetworkInterface.list(
+      includeLoopback: false,
+      type: InternetAddressType.IPv4,
+    );
+    return [
+      for (final interface in interfaces)
+        for (final address in interface.addresses)
+          if (address.type == InternetAddressType.IPv4 &&
+              !address.isLoopback &&
+              !address.isLinkLocal)
+            address.address,
+    ];
   }
 
   Device? _deviceFromService(BonsoirService service) {
@@ -189,5 +218,12 @@ class DiscoveryNotifier extends AsyncNotifier<List<Device>> {
     await _service?.stop();
     _devices.clear();
     state = const AsyncData([]);
+  }
+
+  Future<Device> addManualDevice(String ip) async {
+    final device = await _service!.fetchDevice(ip);
+    _devices[device.id] = device;
+    state = AsyncData(List.unmodifiable(_devices.values));
+    return device;
   }
 }

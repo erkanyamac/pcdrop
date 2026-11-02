@@ -1,16 +1,26 @@
+import '../core/constants.dart';
+
 enum DeviceOperatingSystem {
   windows('windows'),
-  ipados('ipados');
+  ipados('ipados'),
+  unknown('unknown');
 
   const DeviceOperatingSystem(this.value);
 
   final String value;
 
   static DeviceOperatingSystem fromValue(String value) {
-    return DeviceOperatingSystem.values.firstWhere(
-      (operatingSystem) => operatingSystem.value == value,
-      orElse: () => throw FormatException('Unsupported device OS: $value'),
-    );
+    final normalized = value.trim().toLowerCase();
+    if (normalized == 'windows') {
+      return DeviceOperatingSystem.windows;
+    }
+    if (normalized == 'ios' ||
+        normalized == 'ipados' ||
+        normalized == 'ipad' ||
+        normalized == 'apple') {
+      return DeviceOperatingSystem.ipados;
+    }
+    return DeviceOperatingSystem.unknown;
   }
 }
 
@@ -33,37 +43,48 @@ class Device {
   final String version;
   final String? address;
 
-  factory Device.fromJson(Map<String, dynamic> json) {
-    final portValue = json['port'];
-    final port = portValue is num
-        ? portValue.toInt()
-        : int.tryParse(portValue as String? ?? '');
-
-    if (port == null) {
-      throw const FormatException('Device port must be an integer');
-    }
+  factory Device.fromJson(Map<String, dynamic> json, {String? fallbackIp}) {
+    final ip = _firstNonEmptyString(json, const ['ip', 'host']) ?? fallbackIp;
+    final alias =
+        _firstNonEmptyString(json, const [
+          'alias',
+          'name',
+          'deviceName',
+          'model',
+        ]) ??
+        'PCDrop Cihazı (${fallbackIp ?? 'bilinmeyen adres'})';
+    final id =
+        _firstNonEmptyString(json, const [
+          'id',
+          'deviceId',
+          'fingerprint',
+          'uuid',
+        ]) ??
+        fallbackIp ??
+        'unknown-device';
+    final platform = _firstNonEmptyString(json, const [
+      'platform',
+      'deviceType',
+      'os',
+    ]);
 
     return Device(
-      id: _requiredString(json, 'id'),
-      alias: _requiredString(json, 'alias'),
-      deviceModel: _requiredString(json, 'deviceModel'),
-      os: DeviceOperatingSystem.fromValue(_requiredString(json, 'os')),
-      port: port,
-      version: json['version'] as String? ?? '1.0',
-      address: json['address'] as String?,
+      id: id,
+      alias: alias,
+      deviceModel:
+          _firstNonEmptyString(json, const ['deviceModel', 'model']) ?? alias,
+      os: DeviceOperatingSystem.fromValue(platform ?? 'unknown'),
+      port:
+          int.tryParse(json['port']?.toString() ?? '') ??
+          NetworkConstants.defaultPort,
+      version: _firstNonEmptyString(json, const ['version']) ?? '1.0',
+      address:
+          _firstNonEmptyString(json, const ['address', 'ip', 'host']) ?? ip,
     );
   }
 
   factory Device.fromSenderJson(Map<String, dynamic> json) {
-    return Device(
-      id: _requiredString(json, 'id'),
-      alias: _requiredString(json, 'alias'),
-      deviceModel: json['deviceModel'] as String? ?? '',
-      os: DeviceOperatingSystem.fromValue(_requiredString(json, 'os')),
-      port: _optionalPort(json['port']),
-      version: json['version'] as String? ?? '1.0',
-      address: json['address'] as String?,
-    );
+    return Device.fromJson(json);
   }
 
   Map<String, dynamic> toJson() {
@@ -81,22 +102,16 @@ class Device {
     return {'id': id, 'alias': alias, 'os': os.value};
   }
 
-  static int _optionalPort(Object? value) {
-    if (value == null) {
-      return 0;
+  static String? _firstNonEmptyString(
+    Map<String, dynamic> json,
+    List<String> keys,
+  ) {
+    for (final key in keys) {
+      final value = json[key];
+      if (value is String && value.trim().isNotEmpty) {
+        return value;
+      }
     }
-    final port = value is num ? value.toInt() : int.tryParse(value.toString());
-    if (port == null) {
-      throw const FormatException('Device port must be an integer');
-    }
-    return port;
-  }
-
-  static String _requiredString(Map<String, dynamic> json, String key) {
-    final value = json[key];
-    if (value is! String || value.isEmpty) {
-      throw FormatException('Device field "$key" must be a non-empty string');
-    }
-    return value;
+    return null;
   }
 }

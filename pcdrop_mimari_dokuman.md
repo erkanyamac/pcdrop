@@ -50,7 +50,7 @@ dependencies:
   shelf: ^1.4.1                # Yerel HTTP sunucusu (Dosya almak için)
   shelf_router: ^1.1.4         # HTTP uç noktalarını (endpoint) yönlendirmek için
   dio: ^5.4.0                  # HTTP istemcisi (Dosya göndermek ve ilerlemeyi takip etmek için)
-  network_info_plus: ^5.0.2    # Cihazın yerel IPv4 adresini öğrenmek için
+  # Yerel IPv4 adresleri dart:io NetworkInterface.list() ile alınır.
   
   # Dosya ve Windows / iPadOS İşletim Sistemi Entegrasyonu
   receive_sharing_intent: ^1.6.7 # iPadOS Share Extension'dan gelen dosyaları yakalamak için
