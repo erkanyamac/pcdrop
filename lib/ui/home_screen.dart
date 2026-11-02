@@ -1,9 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
+import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:uuid/uuid.dart';
@@ -27,11 +31,34 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   String? _activeSessionId;
   String? _activeToken;
   Device? _activeTarget;
+  String? _sharedFilePath;
+  bool _sharedFileSending = false;
+  Device? _selectedTarget;
+  bool _isDragging = false;
 
   @override
   void initState() {
     super.initState();
+    const MethodChannel('pcdrop/share')
+        .setMethodCallHandler(_handleShareMethod);
     WidgetsBinding.instance.addPostFrameCallback((_) => _initializeServices());
+  }
+
+  @override
+  void dispose() {
+    const MethodChannel('pcdrop/share').setMethodCallHandler(null);
+    super.dispose();
+  }
+
+  Future<void> _handleShareMethod(MethodCall call) async {
+    if (call.method != 'sharedFile' || call.arguments is! String) return;
+    final path = call.arguments as String;
+    if (!mounted) return;
+    setState(() => _sharedFilePath = path);
+    final devices = ref.read(discoveryProvider).asData?.value ?? const [];
+    if (devices.length == 1) {
+      await _sendSharedFile(devices.single);
+    }
   }
 
   Future<void> _initializeServices() async {
@@ -40,7 +67,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     try {
       await ref.read(discoveryProvider.future);
       final localDevice = ref.read(discoveryServiceProvider).localDevice;
-      await transfer.startReceiver(device: localDevice);
+      await transfer.startReceiver(
+        device: localDevice,
+        onDeviceAnnouncement: (device) {
+          ref.read(discoveryProvider.notifier).addAnnouncedDevice(device);
+        },
+      );
       if (mounted) setState(() => _serverRunning = true);
     } catch (error) {
       if (mounted) {
@@ -113,9 +145,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     return result ?? false;
   }
 
-  Future<void> _selectAndSend(Device target) async {
-    final files = await FilePicker.pickFiles();
-    if (files.isEmpty) return;
+  Future<void> _selectAndSend(
+    Device target, {
+    String? sharedPath,
+    List<DropItem>? droppedFiles,
+  }) async {
+    final files = sharedPath == null
+        ? droppedFiles == null
+              ? await FilePicker.pickFiles()
+              : null
+        : null;
+    if (sharedPath == null &&
+        droppedFiles == null &&
+        (files == null || files.isEmpty)) {
+      return;
+    }
+    if (sharedPath != null && !await File(sharedPath).exists()) {
+      _sharedFileSending = false;
+      if (mounted) {
+        _showMessage('Paylaşılan dosyaya erişilemedi.');
+      }
+      return;
+    }
     final address = target.address;
     final localDevice = ref.read(discoveryServiceProvider).localDevice;
     if (address == null || localDevice == null) {
@@ -123,18 +174,25 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       return;
     }
 
-    final selected =
-        <({PlatformFile file, File source, TransferFile metadata})>[];
-    for (final picked in files) {
-      final path = picked.path;
-      if (path == null) continue;
+    final selected = <({File source, TransferFile metadata})>[];
+    final paths = sharedPath == null && droppedFiles != null
+        ? [
+            for (final item in droppedFiles)
+              if (item.path.isNotEmpty) (item.path, item.name),
+          ]
+        : sharedPath == null
+        ? [
+            for (final picked in files!)
+              if (picked.path != null) (picked.path!, picked.name),
+          ]
+        : [(sharedPath, sharedPath.split(Platform.pathSeparator).last)];
+    for (final (path, name) in paths) {
       final source = File(path);
       selected.add((
-        file: picked,
         source: source,
         metadata: TransferFile(
           fileId: const Uuid().v4(),
-          fileName: picked.name,
+          fileName: name,
           size: await source.length(),
           mimeType: 'application/octet-stream',
         ),
@@ -145,41 +203,77 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       return;
     }
 
-    final session = TransferSession(
-      sessionId: const Uuid().v4(),
-      sender: localDevice,
-      files: selected.map((item) => item.metadata).toList(growable: false),
-    );
     final service = ref.read(transferServiceProvider);
     try {
-      final authorization = jsonDecode(
-        await service.prepareUpload(
-          targetIp: address,
-          session: session,
-          targetPort: target.port,
-        ),
-      ) as Map<String, dynamic>;
-      _activeSessionId = authorization['sessionId'] as String;
-      _activeToken = authorization['uploadToken'] as String;
       _activeTarget = target;
+      var failedFiles = 0;
       for (final item in selected) {
-        await service.uploadFile(
-          targetIp: address,
-          targetPort: target.port,
-          sessionId: _activeSessionId!,
-          uploadToken: _activeToken!,
-          file: item.metadata,
-          source: item.source,
+        final session = TransferSession(
+          sessionId: const Uuid().v4(),
+          sender: localDevice,
+          files: [item.metadata],
         );
+        try {
+          final authorization = jsonDecode(
+            await service.prepareUpload(
+              targetIp: address,
+              session: session,
+              targetPort: target.port,
+            ),
+          ) as Map<String, dynamic>;
+          _activeSessionId = authorization['sessionId'] as String;
+          _activeToken = authorization['uploadToken'] as String;
+          await service.uploadFile(
+            targetIp: address,
+            targetPort: target.port,
+            sessionId: _activeSessionId!,
+            uploadToken: _activeToken!,
+            file: item.metadata,
+            source: item.source,
+          );
+          if (mounted) {
+            _showMessage('${item.metadata.fileName} aktarımı tamamlandı.');
+          }
+        } on DioException catch (error) {
+          failedFiles++;
+          final message = service.userFriendlyNetworkError(error);
+          if (mounted) _showMessage(message);
+        } catch (error) {
+          failedFiles++;
+          if (mounted) _showMessage(service.userFriendlyNetworkError(error));
+        } finally {
+          _activeSessionId = null;
+          _activeToken = null;
+        }
       }
-      if (mounted) _showMessage('Aktarım tamamlandı.');
+      if (failedFiles == 0 && mounted) {
+        _showMessage('Aktarım kuyruğu tamamlandı.');
+      }
     } catch (error) {
-      if (mounted) _showMessage('Aktarım başarısız: $error');
+      if (mounted) _showMessage(service.userFriendlyNetworkError(error));
     } finally {
+      if (sharedPath != null && mounted) {
+        setState(() {
+          _sharedFilePath = null;
+          _sharedFileSending = false;
+        });
+      }
       _activeSessionId = null;
       _activeToken = null;
       _activeTarget = null;
     }
+  }
+
+  Future<void> _sendSharedFile(Device device) async {
+    final path = _sharedFilePath;
+    if (path == null || _sharedFileSending) return;
+    _sharedFileSending = true;
+    await _selectAndSend(device, sharedPath: path);
+  }
+
+  Device? get _effectiveTarget {
+    final devices = ref.read(discoveryProvider).asData?.value ?? const [];
+    return _selectedTarget ?? (devices.length == 1 ? devices.single : null);
   }
 
   Future<void> _cancelTransfer() async {
@@ -200,6 +294,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final devices = ref.watch(discoveryProvider);
+    ref.listen(discoveryProvider, (_, next) {
+      final found = next.asData?.value ?? const <Device>[];
+      if (_sharedFilePath != null && found.length == 1) {
+        unawaited(_sendSharedFile(found.single));
+      }
+    });
     final progress = ref.watch(transferProgressProvider);
     final completedTransfers = ref.watch(completedTransfersProvider);
     final discoveryService = ref.read(discoveryServiceProvider);
@@ -219,6 +319,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               '${localIp ?? 'IP aranıyor'} • '
               '${_serverRunning ? 'Sunucu aktif' : 'Sunucu kapalı'}',
             ),
+          ),
+          IconButton(
+            tooltip: 'Yeniden Tara',
+            onPressed: () => ref.read(discoveryProvider.notifier).rescan(),
+            icon: const Icon(Icons.refresh),
           ),
           const SizedBox(width: 12),
           Padding(
@@ -251,7 +356,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ];
             final devicesPanel = _DevicesPanel(
               devices: deviceList,
-              onDeviceTap: _selectAndSend,
+              selectedDevice:
+                  _selectedTarget ??
+                  (deviceList.length == 1 ? deviceList.single : null),
+              onDeviceTap: (device) {
+                final sharedPath = _sharedFilePath;
+                if (sharedPath != null) {
+                  unawaited(_sendSharedFile(device));
+                } else {
+                  setState(() => _selectedTarget = device);
+                }
+              },
+              onDeviceDrop: (device, files) =>
+                  _selectAndSend(device, droppedFiles: files),
             );
             final transfersPanel = _TransfersPanel(
               transfers: transfers,
@@ -259,6 +376,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             );
             return Column(
               children: [
+                if (_sharedFilePath != null && deviceList.length != 1)
+                  MaterialBanner(
+                    content: Text(
+                      'Paylaşıma Hazır: '
+                      '${_sharedFilePath!.split(Platform.pathSeparator).last} '
+                      '(Göndermek için cihaza dokunun)',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => setState(() => _sharedFilePath = null),
+                        child: const Text('Kapat'),
+                      ),
+                    ],
+                  ),
                 const _CompactScanIndicator(),
                 Expanded(
                   child: Padding(
@@ -268,23 +401,57 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                             children: [
                               Expanded(child: devicesPanel),
                               const SizedBox(width: 12),
-                              Expanded(child: transfersPanel),
+                              Expanded(
+                                child: Column(
+                                  children: [
+                                    Expanded(
+                                      child: _Dropzone(
+                                        active: _isDragging,
+                                        onEntered: () =>
+                                            setState(() => _isDragging = true),
+                                        onExited: () =>
+                                            setState(() => _isDragging = false),
+                                        onDropped: _handleDroppedFiles,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 8),
+                                    Expanded(child: transfersPanel),
+                                  ],
+                                ),
+                              ),
                             ],
                           )
                         : Column(
                             children: [
                               Expanded(child: devicesPanel),
                               const SizedBox(height: 8),
-                              Expanded(child: transfersPanel),
+                              Expanded(
+                                child: Column(
+                                  children: [
+                                    Expanded(
+                                      child: _Dropzone(
+                                        active: _isDragging,
+                                        onEntered: () =>
+                                            setState(() => _isDragging = true),
+                                        onExited: () =>
+                                            setState(() => _isDragging = false),
+                                        onDropped: _handleDroppedFiles,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 8),
+                                    Expanded(child: transfersPanel),
+                                  ],
+                                ),
+                              ),
                             ],
                           ),
                   ),
                 ),
                 _BottomActionBar(
-                  enabled: deviceList.isNotEmpty,
-                  onPressed: deviceList.isEmpty
+                  enabled: _effectiveTarget != null,
+                  onPressed: _effectiveTarget == null
                       ? null
-                      : () => _selectAndSend(deviceList.first),
+                      : () => _selectAndSend(_effectiveTarget!),
                 ),
               ],
             );
@@ -292,6 +459,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _handleDroppedFiles(List<DropItem> files) async {
+    setState(() => _isDragging = false);
+    final target = _effectiveTarget;
+    if (target == null) {
+      _showMessage('Önce bir hedef cihaz seçin.');
+      return;
+    }
+    await _selectAndSend(target, droppedFiles: files);
   }
 
   void _showMessage(String message) {
@@ -320,11 +497,110 @@ class _CompactScanIndicator extends StatelessWidget {
   }
 }
 
+class _Dropzone extends StatelessWidget {
+  const _Dropzone({
+    required this.active,
+    required this.onEntered,
+    required this.onExited,
+    required this.onDropped,
+  });
+
+  final bool active;
+  final VoidCallback onEntered;
+  final VoidCallback onExited;
+  final ValueChanged<List<DropItem>> onDropped;
+
+  @override
+  Widget build(BuildContext context) {
+    return DropTarget(
+      onDragEntered: (_) => onEntered(),
+      onDragExited: (_) => onExited(),
+      onDragDone: (details) => onDropped(details.files),
+      child: InkWell(
+        onTap: () {
+          final target = context
+              .findAncestorStateOfType<_HomeScreenState>()
+              ?._effectiveTarget;
+          if (target != null) {
+            unawaited(
+              context
+                  .findAncestorStateOfType<_HomeScreenState>()
+                  ?._selectAndSend(target),
+            );
+          }
+        },
+        child: CustomPaint(
+          foregroundPainter: _DashedBorderPainter(
+            color: active
+                ? Theme.of(context).colorScheme.primary
+                : Theme.of(context).colorScheme.outline,
+          ),
+          child: Container(
+            width: double.infinity,
+            decoration: BoxDecoration(
+              color: active
+                  ? Theme.of(context).colorScheme.primaryContainer
+                  : Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Center(
+              child: Text(
+                active
+                    ? 'Dosyaları Bırakın ve Gönderin'
+                    : 'Dosyaları Buraya Sürükleyin veya Seçmek İçin Tıklayın\n'
+                          '(Çoklu seçim desteklenir)',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DashedBorderPainter extends CustomPainter {
+  const _DashedBorderPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final path = Path()
+      ..addRRect(
+        RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(12)),
+      );
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
+    for (final metric in path.computeMetrics()) {
+      for (var distance = 0.0; distance < metric.length; distance += 12) {
+        canvas.drawPath(
+          metric.extractPath(distance, math.min(distance + 6, metric.length)),
+          paint,
+        );
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DashedBorderPainter oldDelegate) =>
+      oldDelegate.color != color;
+}
+
 class _DevicesPanel extends StatelessWidget {
-  const _DevicesPanel({required this.devices, required this.onDeviceTap});
+  const _DevicesPanel({
+    required this.devices,
+    required this.selectedDevice,
+    required this.onDeviceTap,
+    required this.onDeviceDrop,
+  });
 
   final List<Device> devices;
+  final Device? selectedDevice;
   final ValueChanged<Device> onDeviceTap;
+  final void Function(Device device, List<DropItem> files) onDeviceDrop;
 
   @override
   Widget build(BuildContext context) {
@@ -337,17 +613,28 @@ class _DevicesPanel extends StatelessWidget {
               itemCount: devices.length,
               itemBuilder: (context, index) {
                 final device = devices[index];
-                return ListTile(
-                  dense: true,
-                  leading: Icon(
-                    device.os == DeviceOperatingSystem.windows
-                        ? Icons.desktop_windows
-                        : Icons.tablet_mac,
+                return DropTarget(
+                  onDragDone: (details) => onDeviceDrop(device, details.files),
+                  child: Card(
+                    color: selectedDevice?.id == device.id
+                        ? Theme.of(context).colorScheme.secondaryContainer
+                        : null,
+                    child: ListTile(
+                      dense: true,
+                      leading: Icon(
+                        device.os == DeviceOperatingSystem.windows
+                            ? Icons.desktop_windows
+                            : Icons.tablet_mac,
+                      ),
+                      title: Text(
+                        device.alias,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(device.address ?? 'Adres bilinmiyor'),
+                      trailing: const Icon(Icons.touch_app, size: 18),
+                      onTap: () => onDeviceTap(device),
+                    ),
                   ),
-                  title: Text(device.alias, overflow: TextOverflow.ellipsis),
-                  subtitle: Text(device.address ?? 'Adres bilinmiyor'),
-                  trailing: const Icon(Icons.send, size: 18),
-                  onTap: () => onDeviceTap(device),
                 );
               },
             ),
@@ -441,10 +728,11 @@ class _TransferProgressCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (progress.error != null) {
+      final rejected = progress.status == TransferStatus.rejected;
       return Card(
         child: ListTile(
-          leading: const Icon(Icons.error_outline),
-          title: const Text('Aktarım hatası'),
+          leading: Icon(rejected ? Icons.cancel_outlined : Icons.error_outline),
+          title: Text(rejected ? 'Reddedildi ✕' : 'Aktarım hatası'),
           subtitle: Text(progress.error!),
         ),
       );

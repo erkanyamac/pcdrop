@@ -18,6 +18,9 @@ import '../models/device.dart';
 import '../models/transfer_session.dart';
 
 typedef UploadApprovalCallback = Future<bool> Function(TransferSession session);
+typedef DeviceAnnouncementCallback = FutureOr<void> Function(Device device);
+
+enum TransferStatus { sending, completed, rejected, failed }
 
 class TransferProgress {
   const TransferProgress({
@@ -28,6 +31,7 @@ class TransferProgress {
     this.bytesPerSecond = 0,
     this.remaining = Duration.zero,
     this.isComplete = false,
+    this.status = TransferStatus.sending,
     this.filePath,
     this.error,
   });
@@ -39,6 +43,7 @@ class TransferProgress {
   final double bytesPerSecond;
   final Duration remaining;
   final bool isComplete;
+  final TransferStatus status;
   final String? filePath;
   final String? error;
 
@@ -63,6 +68,7 @@ class TransferProgressNotifier extends Notifier<TransferProgress> {
     required double bytesPerSecond,
     required Duration remaining,
     bool isComplete = false,
+    TransferStatus status = TransferStatus.sending,
     String? filePath,
   }) {
     final next = TransferProgress(
@@ -73,6 +79,7 @@ class TransferProgressNotifier extends Notifier<TransferProgress> {
       bytesPerSecond: bytesPerSecond,
       remaining: remaining,
       isComplete: isComplete,
+      status: status,
       filePath: filePath,
     );
     state = next;
@@ -82,8 +89,25 @@ class TransferProgressNotifier extends Notifier<TransferProgress> {
     }
   }
 
-  void fail(Object error) {
-    state = TransferProgress(error: error.toString());
+  void fail(Object error, {TransferStatus status = TransferStatus.failed}) {
+    state = TransferProgress(error: error.toString(), status: status);
+  }
+
+  void reject({
+    required String fileId,
+    required String fileName,
+    required int totalBytes,
+  }) {
+    final rejected = TransferProgress(
+      fileId: fileId,
+      fileName: fileName,
+      totalBytes: totalBytes,
+      status: TransferStatus.rejected,
+      error: 'Reddedildi',
+    );
+    state = rejected;
+    _completedTransfers.removeWhere((item) => item.fileId == fileId);
+    _completedTransfers.insert(0, rejected);
   }
 }
 
@@ -110,6 +134,27 @@ class TransferService {
   HttpServer? _server;
   Device? _device;
 
+  static const rejectedMessage = 'Karşı cihaz dosya aktarımını reddetti.';
+
+  String userFriendlyNetworkError(Object error) {
+    if (error is DioException) {
+      if (error.response?.statusCode == HttpStatus.forbidden) {
+        return rejectedMessage;
+      }
+      if (error.type == DioExceptionType.connectionTimeout ||
+          error.type == DioExceptionType.receiveTimeout ||
+          error.type == DioExceptionType.sendTimeout) {
+        return 'Karşı cihaza bağlanırken zaman aşımı oluştu.';
+      }
+      if (error.type == DioExceptionType.connectionError) {
+        return 'Karşı cihaza ulaşılamadı.';
+      }
+    }
+    return 'Dosya aktarımı sırasında ağ hatası oluştu.';
+  }
+
+  DeviceAnnouncementCallback? onDeviceAnnouncement;
+
   void setUploadApprovalCallback(UploadApprovalCallback callback) {
     onUploadApproval = callback;
   }
@@ -118,11 +163,13 @@ class TransferService {
     int port = NetworkConstants.defaultPort,
     SecurityContext? securityContext,
     Device? device,
+    DeviceAnnouncementCallback? onDeviceAnnouncement,
   }) async {
     if (_server != null) {
       return;
     }
     _device = device;
+    this.onDeviceAnnouncement = onDeviceAnnouncement;
 
     final router = Router()
       ..get('/api/v1/info', (request) => _info(request))
@@ -142,11 +189,28 @@ class TransferService {
     final server = _server;
     _server = null;
     _device = null;
+    onDeviceAnnouncement = null;
     _grants.clear();
     await server?.close(force: true);
   }
 
   Future<shelf.Response> _info(shelf.Request request) async {
+    final senderIp = request.url.queryParameters['senderIp'];
+    final senderId = request.url.queryParameters['senderId'];
+    if (senderId != null && senderId.isNotEmpty) {
+      final connectionInfo =
+          request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
+      final remoteIp = senderIp ?? connectionInfo?.remoteAddress.address;
+      final announced = Device.fromJson({
+        'id': senderId,
+        'alias': request.url.queryParameters['senderAlias'],
+        'deviceName': request.url.queryParameters['senderAlias'],
+        'os': 'unknown',
+        'port': request.url.queryParameters['senderPort'],
+        'address': remoteIp,
+      }, fallbackIp: remoteIp);
+      await onDeviceAnnouncement?.call(announced);
+    }
     return _jsonResponse({
       'service': 'PCDrop',
       'version': NetworkConstants.protocolVersion,
@@ -323,11 +387,30 @@ class TransferService {
     required TransferSession session,
     int targetPort = NetworkConstants.defaultPort,
   }) async {
-    final response = await _dio.post<Map<String, dynamic>>(
-      'http://$targetIp:$targetPort${NetworkConstants.prepareUploadPath}',
-      data: session.toJson(),
-      options: Options(contentType: NetworkConstants.contentTypeJson),
-    );
+    late Response<Map<String, dynamic>> response;
+    try {
+      response = await _dio.post<Map<String, dynamic>>(
+        'http://$targetIp:$targetPort${NetworkConstants.prepareUploadPath}',
+        data: session.toJson(),
+        options: Options(contentType: NetworkConstants.contentTypeJson),
+      );
+    } on DioException catch (error) {
+      final status = error.response?.statusCode == HttpStatus.forbidden
+          ? TransferStatus.rejected
+          : TransferStatus.failed;
+      for (final file in session.files) {
+        onProgress?.call(
+          TransferProgress(
+            fileId: file.fileId,
+            fileName: file.fileName,
+            totalBytes: file.size,
+            status: status,
+            error: userFriendlyNetworkError(error),
+          ),
+        );
+      }
+      rethrow;
+    }
     final data = response.data;
     if (response.statusCode != HttpStatus.ok ||
         data?['status'] != 'ACCEPTED' ||
@@ -394,8 +477,30 @@ class TransferService {
         isComplete: true,
         filePath: source.path,
       );
+    } on DioException catch (error) {
+      final status = error.response?.statusCode == HttpStatus.forbidden
+          ? TransferStatus.rejected
+          : TransferStatus.failed;
+      onProgress?.call(
+        TransferProgress(
+          fileId: file.fileId,
+          fileName: file.fileName,
+          totalBytes: totalBytes,
+          status: status,
+          error: userFriendlyNetworkError(error),
+        ),
+      );
+      rethrow;
     } catch (error) {
-      onProgress?.call(TransferProgress(error: error.toString()));
+      onProgress?.call(
+        TransferProgress(
+          fileId: file.fileId,
+          fileName: file.fileName,
+          totalBytes: totalBytes,
+          status: TransferStatus.failed,
+          error: userFriendlyNetworkError(error),
+        ),
+      );
       rethrow;
     } finally {
       stopwatch.stop();
@@ -536,6 +641,7 @@ class TransferService {
         bytesPerSecond: bytesPerSecond.toDouble(),
         remaining: remaining,
         isComplete: isComplete,
+        status: isComplete ? TransferStatus.completed : TransferStatus.sending,
         filePath: filePath,
       ),
     );
@@ -555,7 +661,15 @@ final transferServiceProvider = Provider<TransferService>((ref) {
   final service = TransferService(
     onProgress: (value) {
       if (value.error != null) {
-        progress.fail(value.error!);
+        if (value.status == TransferStatus.rejected) {
+          progress.reject(
+            fileId: value.fileId!,
+            fileName: value.fileName!,
+            totalBytes: value.totalBytes,
+          );
+        } else {
+          progress.fail(value.error!, status: value.status);
+        }
         return;
       }
       progress.update(
@@ -566,6 +680,7 @@ final transferServiceProvider = Provider<TransferService>((ref) {
         bytesPerSecond: value.bytesPerSecond,
         remaining: value.remaining,
         isComplete: value.isComplete,
+        status: value.status,
         filePath: value.filePath,
       );
     },
